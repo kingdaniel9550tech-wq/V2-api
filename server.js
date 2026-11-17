@@ -14,6 +14,10 @@ const TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 120000); // self-hos
 const MAX_TOKENS_CAP = num(process.env.MAX_TOKENS_CAP, 1024);   // longest reply you allow
 const MAX_INPUT_CHARS = num(process.env.MAX_INPUT_CHARS, 4000); // longest question you allow
 const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT || 2);      // how many requests the model runs at once
+// Image analysis: used automatically whenever a request contains an image
+const MAX_IMAGE_MB = num(process.env.MAX_IMAGE_MB, 5);                 // biggest image you accept (0 = unlimited)
+const VISION_MODEL = process.env.VISION_MODEL || '@cf/meta/llama-3.2-11b-vision-instruct';
+const VISION_PROVIDER = process.env.VISION_PROVIDER || 'custom';       // which provider serves images
 const DEFAULT_SYSTEM =
   process.env.DEFAULT_SYSTEM ||
   'You are KING AI, a helpful, friendly assistant inside a WhatsApp bot. Keep answers clear and concise.';
@@ -138,9 +142,21 @@ async function withSlot(fn) {
   try { return await fn(); } finally { running--; const nxt = waiting.shift(); if (nxt) nxt(); }
 }
 
+const hasImage = (messages) => messages.some((m) => Array.isArray(m.content) && m.content.some((c) => c && c.type === 'image_url'));
+const textLen = (m) => Array.isArray(m.content)
+  ? m.content.reduce((n, c) => n + (c && c.type === 'text' ? String(c.text || '').length : 0), 0)
+  : String(m.content || '').length;
+const imageMB = (messages) => messages.reduce((n, m) => n + (Array.isArray(m.content)
+  ? m.content.reduce((k, c) => k + (c && c.type === 'image_url' ? String(c.image_url?.url || '').length * 0.75 / 1048576 : 0), 0) : 0), 0);
+
 function complete(messages, opts = {}) {
-  const total = messages.reduce((n, m) => n + String(m.content || '').length, 0);
+  const total = messages.reduce((n, m) => n + textLen(m), 0);
   if (total > MAX_INPUT_CHARS * 3) throw Object.assign(new Error('Input too long'), { status: 413 });
+  if (hasImage(messages)) {
+    if (imageMB(messages) > MAX_IMAGE_MB) throw Object.assign(new Error(`Image too large (max ${MAX_IMAGE_MB} MB)`), { status: 413 });
+    opts.vision = true;
+    if (!opts.model) opts.model = VISION_MODEL;
+  }
   const mt = Math.min(Number(opts.max_tokens) || MAX_TOKENS_CAP, MAX_TOKENS_CAP);
   opts.max_tokens = Number.isFinite(mt) ? mt : undefined;
   return withSlot(() => completeInner(messages, opts));
@@ -148,7 +164,8 @@ function complete(messages, opts = {}) {
 
 async function completeInner(messages, opts = {}) {
   const errors = [];
-  const chain = opts.provider ? providers.filter((p) => p.name === opts.provider) : providers;
+  const chain = opts.vision ? providers.filter((p) => p.name === VISION_PROVIDER)
+    : opts.provider ? providers.filter((p) => p.name === opts.provider) : providers;
   for (const p of chain) {
     const tries = Math.min(p.pool.size(), 4);
     for (let i = 0; i < tries; i++) {
@@ -181,7 +198,7 @@ setInterval(() => {
 
 /* ---------------- App ---------------- */
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: process.env.JSON_LIMIT || '20mb' })); // images arrive as base64, so this must be large
 
 // KING_API_KEYS=keyA:30,keyB:100  (number = requests per minute for that key; default RATE_LIMIT)
 const API_KEYS = new Map(list(process.env.KING_API_KEYS).map((e) => { const [k, l] = e.split(':'); return [k, Number(l) || null]; }));
@@ -251,6 +268,29 @@ app.post('/ask', ask);
 app.post('/reset', (req, res) => {
   memory.delete(String((req.body || {}).user || 'anon'));
   res.json({ ok: true });
+});
+
+// Image analysis: POST { image: <base64 or data URL>, mime?, q?, user?, system? }
+app.post('/vision', async (req, res) => {
+  const src = req.body || {};
+  let img = String(src.image || '').trim();
+  if (!img) return res.status(400).json({ error: 'Missing image (base64 or data URL)' });
+  if (!img.startsWith('data:')) img = `data:${src.mime || 'image/jpeg'};base64,${img}`;
+  const q = String(src.q || 'Describe this image in detail. If it contains any text, read the text out.').trim();
+  const user = String(src.user || 'anon');
+  const uh = (userHits.get(user) || 0) + 1;
+  userHits.set(user, uh);
+  if (uh > USER_RATE) return res.status(429).json({ error: 'You are sending too many requests, wait a minute' });
+  const messages = [
+    { role: 'system', content: src.system || DEFAULT_SYSTEM },
+    { role: 'user', content: [{ type: 'text', text: q }, { type: 'image_url', image_url: { url: img } }] },
+  ];
+  try {
+    const r = await complete(messages, {});
+    res.json({ reply: r.text, provider: r.provider, model: r.model });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message });
+  }
 });
 
 // OpenAI-compatible endpoint (drop-in for Groq / OpenAI SDKs)
