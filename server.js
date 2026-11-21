@@ -6,6 +6,11 @@
  */
 require('dotenv').config();
 const express = require('express');
+const mount = require('./mount');
+const { createDownloader } = require('./downloader');
+const { createWorkerHub } = require('./worker');
+const { createTools } = require('./tools');
+const { createSite } = require('./site');
 
 const PORT = process.env.PORT || 3000;
 // 0 means unlimited
@@ -198,7 +203,20 @@ setInterval(() => {
 
 /* ---------------- App ---------------- */
 const app = express();
-app.use(express.json({ limit: process.env.JSON_LIMIT || '20mb' })); // images arrive as base64, so this must be large
+const completeText = async (messages, opts) => (await complete(messages, opts)).text;
+const workerHub = createWorkerHub({ env: process.env });
+const downloader = createDownloader({ env: process.env, workerHub });
+const tools = createTools({ env: process.env, complete: completeText });
+const site = createSite({ env: process.env, complete: completeText });
+app.set('trust proxy', 1); // Render sits behind a proxy: needed to see each visitor's real IP
+
+// Public routes (your website calls these from the browser) need no API key; everything else does.
+const PUBLIC_PREFIXES = ['/tools', '/site', '/dl', '/worker']; // /worker is protected by WORKER_TOKEN instead
+const isPublicPath = (p) => PUBLIC_PREFIXES.some((x) => p === x || p.startsWith(x + '/'));
+
+const bigJson = express.json({ limit: process.env.JSON_LIMIT || '20mb' }); // images arrive as base64, so this must be large
+const smallJson = express.json({ limit: '60kb' });                          // public routes only get small bodies
+app.use((req, res, next) => (isPublicPath(req.path) ? smallJson : bigJson)(req, res, next));
 
 // KING_API_KEYS=keyA:30,keyB:100  (number = requests per minute for that key; default RATE_LIMIT)
 const API_KEYS = new Map(list(process.env.KING_API_KEYS).map((e) => { const [k, l] = e.split(':'); return [k, Number(l) || null]; }));
@@ -206,10 +224,10 @@ if (!API_KEYS.size) console.warn('[WARN] KING_API_KEYS is empty: your API is ope
 
 app.use((req, res, next) => {
   if (req.path === '/' || req.path === '/health') return next();
-  if (!API_KEYS.size) return next();
   const given = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || req.headers['x-api-key'] || req.query.key;
-  if (!API_KEYS.has(given)) return res.status(401).json({ error: 'Invalid API key' });
-  req.apiKey = given;
+  if (!API_KEYS.size) req.apiKey = given || 'open'; // no keys configured: open server (a warning was printed)
+  else if (API_KEYS.has(given)) req.apiKey = given;
+  if (!req.apiKey && !isPublicPath(req.path)) return res.status(401).json({ error: 'Invalid API key' });
   next();
 });
 
@@ -221,6 +239,7 @@ setInterval(() => userHits.clear(), 60000).unref();
 const hits = new Map();
 setInterval(() => hits.clear(), 60000).unref();
 app.use((req, res, next) => {
+  if (isPublicPath(req.path)) return next(); // public routes have their own per-visitor limit (PUBLIC_RATE)
   const id = req.apiKey || req.ip;
   const n = (hits.get(id) || 0) + 1;
   hits.set(id, n);
@@ -235,6 +254,7 @@ app.get('/health', (_, res) =>
     status: 'ok',
     uptime: Math.round(process.uptime()),
     providers: providers.map((p) => ({ name: p.name, model: p.model, keys: p.pool.size(), ready: p.pool.available() })),
+    modules: { download: downloader.status().filter((d) => d.enabled).map((d) => d.name), worker: workerHub.status().online, tools: true, site: true },
   })
 );
 
@@ -293,6 +313,33 @@ app.post('/vision', async (req, res) => {
   }
 });
 
+// Speech-to-text (Cloudflare Whisper): POST { audio: <base64>, language? } -> { text }
+const WHISPER_MODEL = process.env.WHISPER_MODEL || '@cf/openai/whisper-large-v3-turbo';
+app.post('/transcribe', async (req, res) => {
+  const src = req.body || {};
+  if (!src.audio) return res.status(400).json({ error: 'Missing audio (base64)' });
+  const p = providers.find((x) => x.name === VISION_PROVIDER);
+  const runBase = process.env.CF_RUN_URL || String(p?.url || '').replace(/\/ai\/v1\/chat\/completions.*$/, '/ai/run/');
+  const slot = p && p.pool.next();
+  if (!p || !slot || !runBase.includes('/ai/run/')) return res.status(503).json({ error: 'Speech-to-text needs the Cloudflare provider (custom)' });
+  try {
+    const r = await fetch(runBase + WHISPER_MODEL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${slot.k}` },
+      body: JSON.stringify({ audio: src.audio, ...(src.language ? { language: src.language } : {}) }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.success === false) {
+      p.pool.report(slot, r.status);
+      return res.status(r.status >= 400 ? r.status : 502).json({ error: `transcribe HTTP ${r.status} ${JSON.stringify(data.errors || data).slice(0, 200)}` });
+    }
+    res.json({ text: String(data.result?.text ?? data.text ?? '').trim() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // OpenAI-compatible endpoint (drop-in for Groq / OpenAI SDKs)
 app.post('/v1/chat/completions', async (req, res) => {
   const { messages, temperature, max_tokens, model } = req.body || {};
@@ -313,5 +360,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.status(e.status || 500).json({ error: { message: e.message } });
   }
 });
+
+// ---- extra modules: downloader, tools pack, website backend (each lives in its own file)
+mount(app, [...downloader.routes, ...workerHub.routes, ...tools.routes, ...site.routes], { env: process.env });
 
 app.listen(PORT, () => console.log(`KING AI API running on :${PORT} with providers: ${providers.map((p) => p.name).join(', ') || 'none'}`));
