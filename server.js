@@ -364,4 +364,33 @@ app.post('/v1/chat/completions', async (req, res) => {
 // ---- extra modules: downloader, tools pack, website backend (each lives in its own file)
 mount(app, [...downloader.routes, ...workerHub.routes, ...tools.routes, ...site.routes], { env: process.env });
 
-app.listen(PORT, () => console.log(`KING AI API running on :${PORT} with providers: ${providers.map((p) => p.name).join(', ') || 'none'}`));
+// ---- optional: run the download worker INSIDE this server (EMBEDDED_WORKER=1). No second server needed.
+// It runs from this server's address, so YouTube links are likely to be blocked, but song names (SoundCloud fallback)
+// and many other sites work. Keep files small: this server has little memory.
+function startEmbeddedWorker() {
+  if (process.env.EMBEDDED_WORKER !== '1') return;
+  if (!workerHub.configured()) return console.warn('[embedded worker] WORKER_TOKEN is missing or too short');
+  let worker;
+  try { worker = require('./king-worker'); } catch { return console.error('[embedded worker] king-worker.js must be uploaded next to server.js'); }
+  worker.startFromEnv({
+    ...process.env,
+    HUB_URL: `http://127.0.0.1:${PORT}`,
+    WORKER_NAME: process.env.EMBEDDED_WORKER_NAME || 'render',
+    MAX_FILE_MB: process.env.EMBEDDED_MAX_FILE_MB || '30',
+    CONCURRENCY: '1',
+  }, __dirname).catch((e) => console.error('[embedded worker]', e.message));
+}
+
+// Render's free plan sleeps after 15 minutes without outside visitors. The worker inside the server talks to itself, which does not count,
+// so the server pings its own public address every 10 minutes (needs RENDER_EXTERNAL_URL, which Render sets by itself, or SELF_PING_URL).
+function keepAwake() {
+  const url = process.env.SELF_PING_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!url || (process.env.KEEP_AWAKE !== '1' && process.env.EMBEDDED_WORKER !== '1')) return;
+  setInterval(() => fetch(url.replace(/\/+$/, '') + '/health').catch(() => {}), Number(process.env.SELF_PING_MS || 600000)).unref();
+}
+
+app.listen(PORT, () => {
+  console.log(`KING AI API running on :${PORT} with providers: ${providers.map((p) => p.name).join(', ') || 'none'}`);
+  startEmbeddedWorker();
+  keepAwake();
+});
