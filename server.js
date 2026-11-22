@@ -6,11 +6,28 @@
  */
 require('dotenv').config();
 const express = require('express');
-const mount = require('./mount');
-const { createDownloader } = require('./downloader');
-const { createWorkerHub } = require('./worker');
-const { createTools } = require('./tools');
-const { createSite } = require('./site');
+// Loads one of the API's own files. If it is missing, damaged or the wrong version, say so in plain words (and where Node looked)
+// instead of crashing with a confusing message.
+function load(file, exportName) {
+  let where = file;
+  let mod;
+  try { where = require.resolve(file); mod = require(file); }
+  catch (e) {
+    console.error(`\n[SETUP ERROR] ${file}.js is missing or broken: ${e.message}\nUpload ${file}.js again from king-api-hub.zip, into the ROOT of your GitHub repository (not inside a folder).\n`);
+    process.exit(1);
+  }
+  const part = exportName ? mod && mod[exportName] : mod;
+  if (typeof part !== 'function') {
+    console.error(`\n[SETUP ERROR] Node loaded ${where} for "${file}", but it is not the right file (it has no ${exportName || 'main function'}).\nFix: in your GitHub repository, open ${file}.js, delete any folder or file with a similar name (for example a folder called "${file.replace('./', '')}"), and upload ${file}.js again from king-api-hub.zip into the ROOT of the repository.\n`);
+    process.exit(1);
+  }
+  return part;
+}
+const mount = load('./mount');
+const createDownloader = load('./downloader', 'createDownloader');
+const createWorkerHub = load('./worker', 'createWorkerHub');
+const createTools = load('./tools', 'createTools');
+const createSite = load('./site', 'createSite');
 
 const PORT = process.env.PORT || 3000;
 // 0 means unlimited
