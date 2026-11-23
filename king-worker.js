@@ -112,13 +112,14 @@ async function assertPublicUrl(raw, lookup = (h) => dns.lookup(h, { all: true })
   if (!addrs.length || addrs.some((a) => isPrivateIp(a.address))) throw new JobError('That link is not allowed', 'bad_url');
 }
 
-function buildArgs(job, cfg, { dir, hasFfmpeg, target, client }) {
+function buildArgs(job, cfg, { dir, hasFfmpeg, target, client, impersonate }) {
   const a = ['--no-playlist', '--no-warnings', '--no-progress', '--newline', '--restrict-filenames', '--write-info-json', '--match-filter', '!is_live',
     '--max-filesize', `${cfg.maxFileMb}M`, '-o', path.join(dir, 'out.%(ext)s')];
   if (cfg.jsRuntime && cfg.jsRuntime !== 'none') a.push('--js-runtimes', cfg.jsRuntime);
   if (cfg.cookies) a.push('--cookies', cfg.cookies);
   if (cfg.proxy) a.push('--proxy', cfg.proxy);
   if (client) a.push('--extractor-args', `youtube:player_client=${client}`);
+  if (impersonate) a.push('--impersonate', 'chrome'); // makes yt-dlp look like a real Chrome browser (helps with sites that block scripts)
   const h = cfg.maxHeight;
   if (job.type === 'audio') {
     if (hasFfmpeg) a.push('-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '0');
@@ -141,6 +142,7 @@ function explain(stderr) {
   if (/confirm you.?re not a bot/i.test(s)) return new JobError('YouTube asked this device to sign in (bot check). Try again later, or use a different network.', 'blocked');
   if (/Private video|Video unavailable|This video is (not available|unavailable)|has been removed|account.*terminated/i.test(s)) return new JobError('That video is private or unavailable', 'unavailable');
   if (/Unsupported URL/i.test(s)) return new JobError('That website is not supported', 'unsupported');
+  if (/Failed to parse JSON|Unable to download (JSON|webpage)|HTTP Error 403|Forbidden|cloudflare|captcha|Just a moment/i.test(s)) return new JobError("That website is not answering this server (it may be blocking this server's address)", 'blocked');
   if (/Requested format is not available/i.test(s)) return new JobError('No suitable format was found for that video', 'format');
   if (/larger than max-filesize/i.test(s)) return new JobError('That file is too big', 'too_big');
   if (/HTTP Error 429|Too Many Requests/i.test(s)) return new JobError('Too many requests, try again in a few minutes', 'rate_limited');
@@ -230,6 +232,7 @@ function createWorker(cfg, { fetchImpl = (...a) => fetch(...a), lookup, logger =
       const layers = [];
       if (job.url) {
         for (const client of isYt(job.url) ? [null, ...cfg.ytClients] : [null]) layers.push({ target: job.url, client, label: client ? `YouTube mode ${client}` : 'normal' });
+        if (!isYt(job.url)) layers.push({ target: job.url, client: null, impersonate: true, label: 'browser mode' });
       } else {
         for (const src of cfg.searchSources) {
           if (src === 'youtube') for (const client of [null, ...cfg.ytClients]) layers.push({ target: `ytsearch1:${job.query}`, client, label: client ? `YouTube search (${client})` : 'YouTube search' });
@@ -243,12 +246,16 @@ function createWorker(cfg, { fetchImpl = (...a) => fetch(...a), lookup, logger =
         const left = deadline - Date.now();
         if (left < 4000) break;
         for (const f of fs.readdirSync(dir)) fs.rmSync(path.join(dir, f), { recursive: true, force: true }); // each layer starts clean
-        const res = await run(ytdlp, buildArgs(job, cfg, { dir, hasFfmpeg, target: layer.target, client: layer.client }), { timeoutMs: left, cwd: dir, signal: ac.signal });
+        const res = await run(ytdlp, buildArgs(job, cfg, { dir, hasFfmpeg, target: layer.target, client: layer.client, impersonate: layer.impersonate }), { timeoutMs: left, cwd: dir, signal: ac.signal });
         const produced = res.code === 0 && fs.readdirSync(dir).some((f) => !/\.(info\.json|part|ytdl)$/i.test(f));
         if (produced) { r = res; if (layer.label !== 'normal') logger(`job ${job.id}: worked with ${layer.label}`); break; }
         const why = res.code === 0 ? explain(res.stdout + '\n' + res.stderr) : explain(res.stderr + '\n' + res.stdout);
         errors.push(res.code === 0 && why.code === 'failed' ? new JobError('Nothing was downloaded (the video may be too long or too big)', 'too_big') : why);
         if (why.code === 'too_big' || why.code === 'timeout' || why.code === 'unsupported' || (why.code === 'unavailable' && job.url)) break; // the next layer would not help
+      }
+      if (!r && job.url && job.type === 'audio' && isAudiomack(job.url)) {
+        try { await scrapeAudiomack(job.url, dir); r = { code: 0, stdout: '', stderr: '' }; logger(`job ${job.id}: worked with the Audiomack page reader`); }
+        catch (e) { logger(`job ${job.id}: Audiomack page reader failed: ${e.message}`); errors.push(e instanceof JobError ? e : new JobError(`Audiomack: ${e.message}`, 'failed')); }
       }
       clearInterval(watch);
       if (!r) throw errors.find((x) => x.code === 'blocked') || errors[0] || new JobError('Nothing was downloaded', 'failed');
@@ -265,6 +272,31 @@ function createWorker(cfg, { fetchImpl = (...a) => fetch(...a), lookup, logger =
         meta: { title: info.title || '', thumbnail: info.thumbnail || '', duration: info.duration_string || '', author: info.uploader || info.channel || '' },
       };
     } catch (e) { cleanup(); throw e; } finally { clearInterval(watch); }
+  }
+
+  const isAudiomack = (u) => { try { return /(^|\.)audiomack\.com$/.test(new URL(u).hostname); } catch { return false; } };
+
+  /** Last resort for Audiomack: read the song page like a browser and download the audio file it points to. */
+  async function scrapeAudiomack(url, dir) {
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', Accept: 'text/html,application/xhtml+xml,*/*;q=0.8', Referer: 'https://audiomack.com/' };
+    const page = await fetchImpl(url, { headers, redirect: 'follow', signal: AbortSignal.timeout(30000) });
+    if (!page.ok) throw new JobError(`Audiomack answered ${page.status}`, 'blocked');
+    const html = await page.text();
+    const clean = (u) => u.replace(/\\u002F/gi, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    const found = [...clean(html).matchAll(/https?:\/\/[^"'\\\s<>]+\.(?:mp3|m4a|aac|ogg)[^"'\\\s<>]*/gi)].map((m) => m[0])[0]; // clean the whole page first: sites write slashes as \u002F
+    if (!found) throw new JobError('No audio file was found on that Audiomack page', 'failed');
+    await assertPublicUrl(found, lookup);
+    const meta = /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)/i.exec(html) || /<title>([^<]+)<\/title>/i.exec(html);
+    const title = (meta ? meta[1] : 'Audiomack').replace(/&amp;/g, '&').replace(/&#39;/g, "'").trim().slice(0, 150);
+    const audio = await fetchImpl(found, { headers, redirect: 'follow', signal: AbortSignal.timeout(120000) });
+    if (!audio.ok) throw new JobError(`Audiomack audio answered ${audio.status}`, 'blocked');
+    const ext = ((/\.(mp3|m4a|aac|ogg)/i.exec(found) || [])[1] || 'mp3').toLowerCase();
+    const cap = cfg.maxFileMb * 1048576;
+    let size = 0;
+    const counter = new (require('stream').Transform)({ transform(chunk, enc, cb) { size += chunk.length; cb(size > cap ? new JobError('That file is too big', 'too_big') : null, chunk); } });
+    await require('stream/promises').pipeline(Readable.fromWeb(audio.body), counter, fs.createWriteStream(path.join(dir, `out.${ext}`)));
+    if (size < 10000) throw new JobError('The Audiomack audio file was too small', 'failed');
+    fs.writeFileSync(path.join(dir, 'out.info.json'), JSON.stringify({ title }));
   }
 
   async function upload(jobId, out) {
@@ -363,4 +395,4 @@ if (require.main === module) {
   const w = createWorker(cfg);
   w.start().catch((e) => { console.error('\n' + e.message + '\n'); process.exit(1); });
   process.on('SIGINT', () => { console.log('\nStopping...'); w.stop().then(() => process.exit(0)); });
-  }
+    }
